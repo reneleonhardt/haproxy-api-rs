@@ -18,6 +18,31 @@ impl FilterMethod {
     pub const ALL: u8 = u8::MAX;
 }
 
+/// Selects which transaction helper objects HAProxy materializes for a filter callback.
+///
+/// The default is [`ALL`](Self::ALL), preserving the complete Lua transaction
+/// surface. Filters that use only the callback arguments and a small subset of
+/// helpers can opt into a smaller per-request allocation footprint.
+pub struct TxnFields;
+
+impl TxnFields {
+    pub const FETCHES: u32 = 1 << 0;
+    pub const SAFE_FETCHES: u32 = 1 << 1;
+    pub const CONVERTERS: u32 = 1 << 2;
+    pub const SAFE_CONVERTERS: u32 = 1 << 3;
+    pub const REQUEST_CHANNEL: u32 = 1 << 4;
+    pub const RESPONSE_CHANNEL: u32 = 1 << 5;
+    pub const HTTP: u32 = 1 << 6;
+    pub const HTTP_REQUEST: u32 = 1 << 7;
+    pub const HTTP_RESPONSE: u32 = 1 << 8;
+    /// Exposes a stable native transaction identity for the lifetime of a stream.
+    pub const TRANSACTION_ID: u32 = 1 << 9;
+    /// Enables HAProxy's stream-owned opaque transaction slot.
+    pub const TRANSACTION_SLOT: u32 = 1 << 10;
+    /// Keeps opt-in identity and ownership state out of the legacy default.
+    pub const ALL: u32 = (1 << 9) - 1;
+}
+
 /// A code that filter callback functions may return.
 pub enum FilterResult {
     /// A filtering step is finished for filter.
@@ -50,6 +75,9 @@ pub trait UserFilter: Sized {
 
     /// Continue execution if a filter callback returns an error.
     const CONTINUE_IF_ERROR: bool = true;
+
+    /// Transaction helper objects to materialize for each callback.
+    const TXN_FIELDS: u32 = TxnFields::ALL;
 
     /// Creates a new instance of filter.
     fn new(lua: &Lua, args: Table) -> Result<Self>;
@@ -125,6 +153,7 @@ where
         // Attributes
         class.raw_set("id", type_name::<T>())?;
         class.raw_set("flags", FLT_CFG_FL_HTX)?;
+        class.raw_set("txn_fields", T::TXN_FIELDS)?;
 
         //
         // Methods
@@ -262,5 +291,38 @@ impl<T> DerefMut for UserFilterWrapper<T> {
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct MinimalFilter;
+
+    impl UserFilter for MinimalFilter {
+        const METHODS: u8 = 0;
+        const TXN_FIELDS: u32 = TxnFields::FETCHES | TxnFields::TRANSACTION_ID;
+
+        fn new(_: &Lua, _: Table) -> Result<Self> {
+            Ok(Self)
+        }
+    }
+
+    #[test]
+    fn publishes_the_declared_transaction_capabilities() {
+        let lua = Lua::new();
+        let class = UserFilterWrapper::<MinimalFilter>::make_class(&lua).unwrap();
+
+        assert_eq!(
+            class.get::<u32>("txn_fields").unwrap(),
+            TxnFields::FETCHES | TxnFields::TRANSACTION_ID
+        );
+    }
+
+    #[test]
+    fn legacy_all_keeps_opt_in_transaction_state_out() {
+        assert_eq!(TxnFields::ALL & TxnFields::TRANSACTION_ID, 0);
+        assert_eq!(TxnFields::ALL & TxnFields::TRANSACTION_SLOT, 0);
     }
 }
