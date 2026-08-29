@@ -154,7 +154,7 @@ fn registration_error(status: i32) -> NativeFilterRegistrationError {
     }
 }
 
-/// Registers a process-resident native filter provider with a matching HAProxy.
+/// Registers a process-resident native filter provider with a compatible HAProxy.
 ///
 /// The descriptor and every callback must remain loaded until HAProxy has
 /// released all filter instances created from it.
