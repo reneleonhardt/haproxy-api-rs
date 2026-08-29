@@ -1,7 +1,7 @@
 use std::future::{self, Future};
 use std::net::TcpListener as StdTcpListener;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::task::{Context, Poll};
 
@@ -14,13 +14,9 @@ use mlua::{
 use rustc_hash::FxBuildHasher;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
-use tokio::runtime;
 use tokio::sync::oneshot::{self, Receiver};
 
-// Using `u16` will give us max 65536 receivers to store.
-// If for any reason future was not picked up by the notification listener,
-// receiver will be overwritten on the counter reset (and memory released).
-type FutureId = u16;
+type FutureId = u64;
 
 // Number of open connections to the notification server
 const PER_WORKER_POOL_SIZE: usize = 512;
@@ -28,27 +24,20 @@ const PER_WORKER_POOL_SIZE: usize = 512;
 // Link between future id and the corresponding receiver (used to signal when the future is ready)
 static FUTURE_RX_MAP: OnceLock<DashMap<FutureId, Receiver<()>, FxBuildHasher>> = OnceLock::new();
 
-/// Returns the global tokio runtime.
-pub fn runtime() -> &'static runtime::Runtime {
-    static RUNTIME: OnceLock<runtime::Runtime> = OnceLock::new();
-    RUNTIME.get_or_init(|| {
-        runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("failed to create tokio runtime")
+pub use crate::runtime::runtime;
+
+fn get_notification_listener() -> &'static StdTcpListener {
+    static NOTIFICATION_LISTENER: OnceLock<StdTcpListener> = OnceLock::new();
+    NOTIFICATION_LISTENER.get_or_init(|| {
+        StdTcpListener::bind("127.0.0.1:0").expect("failed to bind to a local port")
     })
 }
 
-// Find first free port
 fn get_notification_port() -> u16 {
-    static NOTIFICATION_PORT: OnceLock<u16> = OnceLock::new();
-    *NOTIFICATION_PORT.get_or_init(|| {
-        StdTcpListener::bind("127.0.0.1:0")
-            .expect("failed to bind to a local port")
-            .local_addr()
-            .expect("failed to get local address")
-            .port()
-    })
+    get_notification_listener()
+        .local_addr()
+        .expect("failed to get local address")
+        .port()
 }
 
 fn get_rx_by_future_id(future_id: FutureId) -> Option<Receiver<()>> {
@@ -65,14 +54,17 @@ fn set_rx_by_future_id(future_id: FutureId, rx: Receiver<()>) {
 fn get_future_id() -> FutureId {
     static WATCHER: OnceLock<()> = OnceLock::new();
     WATCHER.get_or_init(|| {
-        let port = get_notification_port();
+        let listener = get_notification_listener()
+            .try_clone()
+            .expect("failed to clone notification listener");
+        listener
+            .set_nonblocking(true)
+            .expect("failed to configure notification listener");
+        let listener = TcpListener::from_std(listener)
+            .expect("failed to configure async notification listener");
 
         // Spawn notification task (it responds to subscribe requests and signal when the future is ready)
         runtime().spawn(async move {
-            let listener = TcpListener::bind(("127.0.0.1", port))
-                .await
-                .unwrap_or_else(|err| panic!("failed to bind to a port {port}: {err}"));
-
             while let Ok((mut stream, _)) = listener.accept().await {
                 tokio::task::spawn(async move {
                     let (reader, mut writer) = stream.split();
@@ -107,8 +99,10 @@ fn get_future_id() -> FutureId {
     });
 
     // Future id generator
-    static NEXT_ID: AtomicU16 = AtomicU16::new(1);
-    NEXT_ID.fetch_add(1, Ordering::Relaxed)
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+    NEXT_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .expect("future id space exhausted")
 }
 
 /// Creates a new async function that can be used in HAProxy configuration.
@@ -122,8 +116,9 @@ where
     FR: Future<Output = Result<R>> + Send + 'static,
 {
     let port = get_notification_port();
-    let _yield_fixup = YieldFixUp::new(lua, port)?;
+    let yield_fixup = YieldFixUp::new(lua, port)?;
     lua.create_async_function(move |lua, args| {
+        let _ = &yield_fixup;
         // New future id must be generated on each invocation
         let future_id = get_future_id();
 
@@ -151,10 +146,14 @@ where
     })
 }
 
-struct YieldFixUp<'lua>(&'lua Lua, Function);
+const YIELD_ORIGINAL_KEY: &str = "__HAPROXY_ASYNC_ORIGINAL_YIELD";
+const YIELD_WRAPPER_KEY: &str = "__HAPROXY_ASYNC_YIELD_WRAPPER";
+const YIELD_USERS_KEY: &str = "__HAPROXY_ASYNC_YIELD_USERS";
 
-impl<'lua> YieldFixUp<'lua> {
-    fn new(lua: &'lua Lua, port: u16) -> Result<Self> {
+struct YieldFixUp(Lua);
+
+impl YieldFixUp {
+    fn new(lua: &Lua, port: u16) -> Result<Self> {
         let connection_pool =
             match lua.named_registry_value::<Value>("__HAPROXY_CONNECTION_POOL")? {
                 Value::Nil => {
@@ -165,6 +164,15 @@ impl<'lua> YieldFixUp<'lua> {
                 }
                 connection_pool => connection_pool,
             };
+
+        let active: Option<u64> = lua.named_registry_value(YIELD_USERS_KEY)?;
+        if let Some(active) = active {
+            let active = active.checked_add(1).ok_or_else(|| {
+                mlua::Error::RuntimeError("async yield user count exhausted".into())
+            })?;
+            lua.set_named_registry_value(YIELD_USERS_KEY, active)?;
+            return Ok(Self(lua.clone()));
+        }
 
         let coroutine: Table = lua.globals().get("coroutine")?;
         let orig_yield: Function = coroutine.get("yield")?;
@@ -216,16 +224,47 @@ impl<'lua> YieldFixUp<'lua> {
             "#,
             )
             .call((port, connection_pool))?;
-        coroutine.set("yield", new_yield)?;
-        Ok(YieldFixUp(lua, orig_yield))
+        lua.set_named_registry_value(YIELD_ORIGINAL_KEY, &orig_yield)?;
+        lua.set_named_registry_value(YIELD_WRAPPER_KEY, &new_yield)?;
+        lua.set_named_registry_value(YIELD_USERS_KEY, 1u64)?;
+        if let Err(error) = coroutine.set("yield", new_yield) {
+            let _ = lua.set_named_registry_value(YIELD_USERS_KEY, Value::Nil);
+            let _ = lua.set_named_registry_value(YIELD_WRAPPER_KEY, Value::Nil);
+            let _ = lua.set_named_registry_value(YIELD_ORIGINAL_KEY, Value::Nil);
+            return Err(error);
+        }
+        Ok(YieldFixUp(lua.clone()))
     }
 }
 
-impl<'lua> Drop for YieldFixUp<'lua> {
+impl Drop for YieldFixUp {
     fn drop(&mut self) {
         if let Err(e) = (|| {
+            let active: Option<u64> = self.0.named_registry_value(YIELD_USERS_KEY)?;
+            let Some(active) = active else {
+                return Ok(());
+            };
+            if active > 1 {
+                self.0
+                    .set_named_registry_value(YIELD_USERS_KEY, active - 1)?;
+                return Ok(());
+            }
+
             let coroutine: Table = self.0.globals().get("coroutine")?;
-            coroutine.set("yield", &self.1)
+            let current: Value = coroutine.get("yield")?;
+            let wrapper: Function = self.0.named_registry_value(YIELD_WRAPPER_KEY)?;
+            if let Value::Function(current) = current {
+                if current.to_pointer() == wrapper.to_pointer() {
+                    let original: Function = self.0.named_registry_value(YIELD_ORIGINAL_KEY)?;
+                    coroutine.set("yield", original)?;
+                }
+            }
+            self.0
+                .set_named_registry_value(YIELD_USERS_KEY, Value::Nil)?;
+            self.0
+                .set_named_registry_value(YIELD_WRAPPER_KEY, Value::Nil)?;
+            self.0
+                .set_named_registry_value(YIELD_ORIGINAL_KEY, Value::Nil)
         })() {
             eprintln!("Error in YieldFixUp destructor: {e}");
         }
@@ -279,5 +318,68 @@ where
                 Poll::Pending
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn async_function_keeps_yield_fixup_alive() {
+        let lua = Lua::new();
+        let core = lua.create_table().unwrap();
+        core.set("msleep", lua.create_function(|_, _: u64| Ok(())).unwrap())
+            .unwrap();
+        lua.globals().set("core", core).unwrap();
+        lua.load("yield_before = coroutine.yield").exec().unwrap();
+
+        let _function =
+            create_async_function(&lua, |()| async { Ok::<_, mlua::Error>(()) }).unwrap();
+        let replaced: bool = lua
+            .load("return coroutine.yield ~= yield_before")
+            .eval()
+            .unwrap();
+
+        assert!(replaced);
+    }
+
+    #[test]
+    fn async_yield_fixup_survives_multiple_registrations() {
+        let lua = Lua::new();
+        let core = lua.create_table().unwrap();
+        core.set("msleep", lua.create_function(|_, _: u64| Ok(())).unwrap())
+            .unwrap();
+        lua.globals().set("core", core).unwrap();
+
+        let original: Function = lua.load("return coroutine.yield").eval().unwrap();
+        let first = create_async_function(&lua, |()| async { Ok::<_, mlua::Error>(()) }).unwrap();
+        let wrapper: Function = lua
+            .globals()
+            .get::<Table>("coroutine")
+            .unwrap()
+            .get("yield")
+            .unwrap();
+        let second = create_async_function(&lua, |()| async { Ok::<_, mlua::Error>(()) }).unwrap();
+
+        drop(first);
+        lua.gc_collect().unwrap();
+        let after_first: Function = lua
+            .globals()
+            .get::<Table>("coroutine")
+            .unwrap()
+            .get("yield")
+            .unwrap();
+        assert_eq!(after_first.to_pointer(), wrapper.to_pointer());
+
+        drop(second);
+        lua.gc_collect().unwrap();
+        let after_last: Function = lua
+            .globals()
+            .get::<Table>("coroutine")
+            .unwrap()
+            .get("yield")
+            .unwrap();
+        assert_eq!(after_last.to_pointer(), original.to_pointer());
     }
 }

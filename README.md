@@ -18,6 +18,9 @@ A multi-threaded tokio runtime is automatically started when the first async fun
 
 Please check the [async_serve_file](examples/async_serve_file) example to see how to serve files asynchronously.
 
+Native HAProxy modules should enable the `module` feature on `haproxy-api` and
+select the Lua version used by HAProxy, for example `lua54`.
+
 [HAProxy]: http://www.haproxy.org/
 [Lua API]: http://www.arpalert.org/src/haproxy-lua-api/2.6/index.html
 [mlua]: https://github.com/khvzak/mlua
