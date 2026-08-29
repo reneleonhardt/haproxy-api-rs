@@ -21,10 +21,12 @@ exclude = [
     "examples/async_serve_file",
     "examples/brotli",
     "examples/simple",
+    "fuzz",
 ]
 
 [features]
 default = ["async", "lua55"]
+fuzzing = ["lua55"]
 lua = ["dep:mlua"]
 native = []
 runtime = ["dep:tokio"]

@@ -21,6 +21,8 @@ mod event_sub;
 mod fetches;
 #[cfg(feature = "lua")]
 mod filter;
+#[cfg(feature = "fuzzing")]
+pub mod fuzz;
 #[cfg(feature = "lua")]
 mod http;
 #[cfg(feature = "lua")]
