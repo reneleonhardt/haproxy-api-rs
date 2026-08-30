@@ -6,7 +6,7 @@ use mlua::{FromLua, IntoLua, Lua, LuaString, ObjectLike, Result, Table, Value};
 pub struct Channel(Table);
 
 impl Channel {
-    /// Copies the string at the end of incoming data in the channel buffer.
+    /// Appends `data` to incoming data in the channel buffer.
     ///
     /// Returns the copied length on success or -1 if data cannot be copied.
     #[inline]
@@ -40,7 +40,7 @@ impl Channel {
         self.0.call_method("input", ())
     }
 
-    /// Copies the `data` at the `offset` in incoming data of the channel buffer.
+    /// Inserts `data` into incoming channel data at the `offset`.
     ///
     /// Returns the copied length on success or -1 if data cannot be copied.
     ///

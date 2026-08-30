@@ -37,12 +37,12 @@ lua54 = ["lua", "mlua/lua54"]
 lua55 = ["lua", "mlua/lua55"]
 
 [dependencies]
-mlua = { version = "0.12", optional = true, features = ["serde", "error-send"] }
-tokio = { version = "1.53", features = ["net", "io-util", "sync", "rt-multi-thread"], optional = true }
+mlua = { version = "0.12", optional = true, features = ["serde", "error-send", "macros"] }
+tokio = { version = "1", features = ["net", "io-util", "sync", "rt-multi-thread", "macros"], optional = true }
 pin-project-lite = { version = "0.2", optional = true }
 futures-util = { version = "0.3", optional = true }
-rustc-hash = { version = "2.1", optional = true }
-dashmap = { version = "6.2", optional = true }
+rustc-hash = { version = "2", optional = true }
+dashmap = { version = "6", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
