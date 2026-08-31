@@ -35,7 +35,7 @@ Use Cargo directly for native modules or another explicit feature set.
 
 This release includes source-breaking changes:
 
-- It requires `mlua` 0.12.
+- Lua-enabled builds use `mlua` 0.12.
 - Results that may be `nil` now return `Result<Option<T>>`.
 - `StickTable::dump` accepts an optional Lua table filter.
 - `EventSub::unsub` returns `Result<()>`.

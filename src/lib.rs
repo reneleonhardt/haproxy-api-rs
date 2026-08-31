@@ -9,6 +9,10 @@
 
 #[cfg(feature = "async")]
 mod r#async;
+#[cfg(feature = "async")]
+mod async_pool;
+#[cfg(feature = "async")]
+mod async_pool_lua;
 #[cfg(feature = "lua")]
 mod channel;
 #[cfg(feature = "lua")]
