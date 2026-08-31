@@ -7,19 +7,15 @@ use std::task::{Context, Poll};
 
 use dashmap::DashMap;
 use futures_util::future::Either;
-use mlua::{
-    ExternalResult, FromLuaMulti, Function, IntoLuaMulti, Lua, RegistryKey, Result, Table,
-    UserData, UserDataMethods, Value,
-};
+use mlua::{ExternalResult, FromLuaMulti, Function, IntoLuaMulti, Lua, Result, Table, Value};
 use rustc_hash::FxBuildHasher;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot::{self, Receiver};
 
-type FutureId = u64;
+use crate::async_pool::{ObjectPool, PER_WORKER_POOL_SIZE};
 
-// Number of open connections to the notification server
-const PER_WORKER_POOL_SIZE: usize = 512;
+type FutureId = u64;
 
 // Link between future id and the corresponding receiver (used to signal when the future is ready)
 static FUTURE_RX_MAP: OnceLock<DashMap<FutureId, Receiver<()>, FxBuildHasher>> = OnceLock::new();
@@ -157,7 +153,7 @@ impl YieldFixUp {
         let connection_pool =
             match lua.named_registry_value::<Value>("__HAPROXY_CONNECTION_POOL")? {
                 Value::Nil => {
-                    let connection_pool = ObjectPool::new(PER_WORKER_POOL_SIZE)?;
+                    let connection_pool = ObjectPool::new(PER_WORKER_POOL_SIZE);
                     let connection_pool = lua.create_userdata(connection_pool)?;
                     lua.set_named_registry_value("__HAPROXY_CONNECTION_POOL", &connection_pool)?;
                     Value::UserData(connection_pool)
@@ -271,28 +267,6 @@ impl Drop for YieldFixUp {
     }
 }
 
-struct ObjectPool(Vec<RegistryKey>);
-
-impl ObjectPool {
-    fn new(capacity: usize) -> Result<Self> {
-        Ok(ObjectPool(Vec::with_capacity(capacity)))
-    }
-}
-
-impl UserData for ObjectPool {
-    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_method_mut("get", |_, this, ()| Ok(this.0.pop()));
-
-        methods.add_method_mut("put", |_, this, obj: RegistryKey| {
-            if this.0.len() == PER_WORKER_POOL_SIZE {
-                return Ok(false);
-            }
-            this.0.push(obj);
-            Ok(true)
-        });
-    }
-}
-
 pin_project_lite::pin_project! {
     struct HaproxyFuture<F> {
         lua: Lua,
@@ -381,5 +355,46 @@ mod tests {
             .get("yield")
             .unwrap();
         assert_eq!(after_last.to_pointer(), original.to_pointer());
+    }
+
+    #[tokio::test]
+    async fn async_hook_yield_preserves_stack() -> Result<()> {
+        use std::future::{poll_fn, Future};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::task::Poll;
+
+        let lua = Lua::new();
+        let thread = lua.create_thread(
+            lua.load(
+                r#"
+                local x = 40
+                local y = 2
+                return x + y
+            "#,
+            )
+            .into_function()?,
+        )?;
+
+        let yielded = std::sync::Arc::new(AtomicBool::new(false));
+        let yielded2 = yielded.clone();
+        thread.set_hook(mlua::HookTriggers::EVERY_LINE, move |lua, debug| {
+            if debug.current_line() == Some(4) && !yielded2.swap(true, Ordering::Relaxed) {
+                lua.remove_hook();
+                return Ok(mlua::VmState::Yield);
+            }
+            Ok(mlua::VmState::Continue)
+        })?;
+
+        let mut thread = Box::pin(thread.into_async::<i32>(())?);
+        poll_fn(|cx| {
+            assert!(thread.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert!(yielded.load(Ordering::Relaxed));
+        lua.gc_collect()?;
+        assert_eq!(thread.await?, 42);
+
+        Ok(())
     }
 }
